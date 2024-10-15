@@ -1,6 +1,6 @@
 #!/bin/bash
 
-PORTS_FILE="/opt/rustymanager/ports"
+PORTS_FILE="/opt/rustyproxy/ports"
 
 # Função para verificar se uma porta está em uso
 is_port_in_use() {
