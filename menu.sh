@@ -74,22 +74,22 @@ show_menu() {
     clear
     echo "================= RustyManager ================="
     echo "------------------------------------------------"
-    echo "|                Portas RustyProxy              |"
+    printf "|               %-31s|\n" "Portas RustyProxy"
     echo "------------------------------------------------"
-    echo "| Portas ativas:                                |"
+    printf "| %-45s|\n" "Portas ativas:"
     
     if [ ! -s "$PORTS_FILE" ]; then
-        echo "|   - Nenhuma porta ativa                       |"
+        printf "|   - %-40s|\n" "Nenhuma porta ativa"
     else
         while read -r port; do
-            echo "|   - $port                                     |"
+            printf "|   - %-41s|\n" "$port"
         done < "$PORTS_FILE"
     fi
-    
+
     echo "------------------------------------------------"
-    echo "| 1 - Abrir Porta                               |"
-    echo "| 2 - Fechar Porta                              |"
-    echo "| 0 - Voltar ao menu                            |"
+    printf "| %-45s|\n" "1 - Abrir Porta"
+    printf "| %-45s|\n" "2 - Fechar Porta"
+    printf "| %-45s|\n" "0 - Voltar ao menu"
     echo "------------------------------------------------"
     echo
     read -p " --> Selecione uma opção: " option
