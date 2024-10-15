@@ -22,7 +22,7 @@ add_proxy_port() {
         return
     fi
 
-    local command="/opt/rustymanager/proxy --port $port --status $status"
+    local command="/opt/rustyproxy/proxy --port $port --status $status"
     local service_file_path="/etc/systemd/system/proxy${port}.service"
     local service_file_content="[Unit]
 Description=RustyProxy${port}
