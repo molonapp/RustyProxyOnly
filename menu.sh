@@ -76,14 +76,16 @@ show_menu() {
     echo "------------------------------------------------"
     printf "|               %-31s|\n" "Portas RustyProxy"
     echo "------------------------------------------------"
-    printf "| %-45s|\n" "Portas ativas:"
     
+    # Verifica se há portas ativas
     if [ ! -s "$PORTS_FILE" ]; then
-        printf "|   - %-40s|\n" "Nenhuma porta ativa"
+        printf "| Portas(s): %-34s|\n" "nenhuma"
     else
+        active_ports=""
         while read -r port; do
-            printf "|   - %-41s|\n" "$port"
+            active_ports+=" $port"
         done < "$PORTS_FILE"
+        printf "| Portas(s):%-35s|\n" "$active_ports"
     fi
 
     echo "------------------------------------------------"
@@ -123,6 +125,8 @@ show_menu() {
             ;;
     esac
 }
+
+
 
 # Verificar se o arquivo de portas existe, caso contrário, criar
 if [ ! -f "$PORTS_FILE" ]; then
