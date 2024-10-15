@@ -69,33 +69,57 @@ del_proxy_port() {
     echo "Porta $port fechada com sucesso."
 }
 
-# Função para exibir o menu
+# Função para exibir o menu formatado
 show_menu() {
-    echo "1) Abrir porta de proxy"
-    echo "2) Fechar porta de proxy"
-    echo "3) Listar portas abertas"
-    echo "4) Sair"
-    read -p "Escolha uma opção: " option
+    clear
+    echo "================= RustyManager ================="
+    echo "------------------------------------------------"
+    echo "|                Portas RustyProxy              |"
+    echo "------------------------------------------------"
+    echo "| Portas ativas:                                |"
+    
+    if [ ! -s "$PORTS_FILE" ]; then
+        echo "|   - Nenhuma porta ativa                       |"
+    else
+        while read -r port; do
+            echo "|   - $port                                     |"
+        done < "$PORTS_FILE"
+    fi
+    
+    echo "------------------------------------------------"
+    echo "| 1 - Abrir Porta                               |"
+    echo "| 2 - Fechar Porta                              |"
+    echo "| 0 - Voltar ao menu                            |"
+    echo "------------------------------------------------"
+    echo
+    read -p " --> Selecione uma opção: " option
 
     case $option in
         1)
-            read -p "Informe a porta a ser aberta: " port
-            read -p "Informe o status (opcional): " status
+            read -p "Digite a porta: " port
+            while ! [[ $port =~ ^[0-9]+$ ]]; do
+                echo "Digite uma porta válida."
+                read -p "Digite a porta: " port
+            done
+            read -p "Digite o status de conexão (deixe vazio para o padrão): " status
             add_proxy_port $port "$status"
+            read -p "> Porta ativada com sucesso. Pressione qualquer tecla para voltar ao menu." dummy
             ;;
         2)
-            read -p "Informe a porta a ser fechada: " port
+            read -p "Digite a porta: " port
+            while ! [[ $port =~ ^[0-9]+$ ]]; do
+                echo "Digite uma porta válida."
+                read -p "Digite a porta: " port
+            done
             del_proxy_port $port
+            read -p "> Porta desativada com sucesso. Pressione qualquer tecla para voltar ao menu." dummy
             ;;
-        3)
-            echo "Portas abertas:"
-            cat "$PORTS_FILE"
-            ;;
-        4)
+        0)
             exit 0
             ;;
         *)
-            echo "Opção inválida."
+            echo "Opção inválida. Pressione qualquer tecla para voltar ao menu."
+            read -n 1 dummy
             ;;
     esac
 }

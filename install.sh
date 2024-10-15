@@ -88,7 +88,7 @@ else
     show_progress "Compilando RustyProxy, isso pode levar algum tempo dependendo da maquina..."
     git clone https://github.com/UlekBR/RustyProxyOnly.git /root/RustyProxyOnly > /dev/null 2>&1 || error_exit "Falha ao clonar rustyproxy"
     mv /root/RustyProxyOnly/menu.sh /opt/rustyproxy/menu
-    /root/RustyProxyOnly/RustyProxy
+    cd /root/RustyProxyOnly/RustyProxy
     cargo build --release --jobs $(nproc) > /dev/null 2>&1 || error_exit "Falha ao compilar rustyproxy"
     mv ./target/release/RustyProxy /opt/rustyproxy/proxy
     increment_step
