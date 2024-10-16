@@ -72,9 +72,9 @@ del_proxy_port() {
 # Função para exibir o menu formatado
 show_menu() {
     clear
-    echo "================= RustyManager ================="
+    echo "================= @RustyManager ================"
     echo "------------------------------------------------"
-    printf "|               %-31s|\n" "Portas RustyProxy"
+    printf "|               %-28s|\n" "RUSTY PROXY"
     echo "------------------------------------------------"
     
     # Verifica se há portas ativas
