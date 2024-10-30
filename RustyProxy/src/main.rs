@@ -95,7 +95,7 @@ fn peek_stream(read_stream: &TcpStream) -> Result<String, Error> {
 
 fn get_port() -> u16 {
     let args: Vec<String> = env::args().collect();
-    let mut port = 80; // Valor padrão
+    let mut port = 80;
 
     for i in 1..args.len() {
         if args[i] == "--port" {
@@ -110,7 +110,7 @@ fn get_port() -> u16 {
 
 fn get_status() -> String {
     let args: Vec<String> = env::args().collect();
-    let mut status = String::from("@RustyManager"); // Valor padrão
+    let mut status = String::from("@RustyManager");
 
     for i in 1..args.len() {
         if args[i] == "--status" {
