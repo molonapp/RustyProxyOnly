@@ -1,6 +1,6 @@
 [package]
-name = "RustyProxyRE"
-version = "0.1.0"
+name = "RustyProxy"
 edition = "2021"
+
 
 [dependencies]

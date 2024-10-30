@@ -86,6 +86,12 @@ else
 
     # ---->>>> Instalar o RustyProxy
     show_progress "Compilando RustyProxy, isso pode levar algum tempo dependendo da maquina..."
+
+    if [ -d "/root/RustyProxy" ]; then
+        rm -rf /root/RustyProxy
+    fi
+
+
     git clone --branch "test" https://github.com/UlekBR/RustyProxyOnly.git /root/RustyProxyOnly > /dev/null 2>&1 || error_exit "Falha ao clonar rustyproxy"
     mv /root/RustyProxyOnly/menu.sh /opt/rustyproxy/menu
     cd /root/RustyProxyOnly/RustyProxy
