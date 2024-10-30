@@ -4,7 +4,6 @@ O RustyProxy é um script simples e otimizado configurável para servidores de p
 - **Websocket**
 - **Security**
 - **ProxySocks**
-- **Dropbear**
 
 
 ## Comando de Instalação

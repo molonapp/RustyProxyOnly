@@ -1,120 +1,124 @@
-use std::error::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use clap::{arg, Parser};
+use std::io::{Error, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::{env, thread};
 
-
-#[derive(Parser)]
-#[command(name = "RustyProxy")]
-#[command(about = "a simple proxy")]
-struct Args {
-    #[arg(long, default_value = "80")]
-    port: u16,
-    #[arg(long, default_value = "@RustyProxy")]
-    status: String,
+fn main() {
+    // Iniciando o proxy
+    let listener = TcpListener::bind(format!("[::]:{}", get_port())).unwrap();
+    start_http(listener);
 }
 
-
-const BUFLEN: usize = 4096 * 16;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
-
-    let addr = format!("[::]:{}", args.port);
-    let ws_response = format!("HTTP/1.1 101 {}\r\n\r\n", args.status);
-    let response = format!("HTTP/1.1 200 {}\r\n\r\n", args.status);
-    let listener = TcpListener::bind(&addr).await?;
-    println!("Proxy server listening on {}", addr);
-
-    loop {
-        let (client_socket, _) = listener.accept().await?;
-        let ws_response = ws_response.clone();
-        let response = response.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(client_socket, &ws_response, &response).await {
-                eprintln!("Connection error: {}", e);
-            }
-        });
-    }
-
-}
-
-
-async fn handle_client(
-    mut client_socket: TcpStream,
-    ws_response: &str,
-    response: &str
-) -> Result<(), Box<dyn Error>> {
-    let mut client_buffer = vec![0; BUFLEN];
-    client_socket.write_all(ws_response.as_ref()).await?;
-
-    let n = client_socket.read(&mut client_buffer).await?;
-    let payload = &client_buffer[..n];
-    if let Ok(payload_str) = String::from_utf8(payload.to_vec()) {
-        if !payload_str.to_lowercase().contains("upgrade: websocket") && !payload_str.contains("upgrade: ws") {
-            client_socket.write_all(response.as_ref()).await?;
-        }
-    }
-
-    connect_target("127.0.0.1:22", &mut client_socket).await?;
-    Ok(())
-}
-
-
-async fn connect_target(host: &str, client_socket: &mut TcpStream) -> Result<(), Box<dyn Error>> {
-    let mut retries = 3;
-    while retries > 0 {
-        match TcpStream::connect(host).await {
-            Ok(mut target_socket) => {
-                do_forwarding(client_socket, &mut target_socket).await?;
-                return Ok(());
+fn start_http(listener: TcpListener) {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut client_stream) => {
+                thread::spawn(move || {
+                    handle_client(&mut client_stream);
+                });
             }
             Err(e) => {
-                eprintln!("Error connecting to target {}: {}", host, e);
-                retries -= 1;
-                if retries == 0 {
-                    return Err(Box::new(e));
-                }
+                eprintln!("Error accepting connection: {}", e);
             }
         }
     }
-    Ok(())
 }
 
-async fn do_forwarding(client_socket: &mut TcpStream, target_socket: &mut TcpStream) -> Result<(), Box<dyn Error>> {
-    let mut client_buf = vec![0; BUFLEN];
-    let mut target_buf = vec![0; BUFLEN];
+fn handle_client(client_stream: &mut TcpStream) {
+    let status = get_status();
+    if client_stream.write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes()).is_err() {
+        return;
+    }
 
-    loop {
-        tokio::select! {
-            result = client_socket.read(&mut client_buf) => {
-                match result {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        target_socket.write_all(&client_buf[..n]).await?;
-                    }
-                    Err(e) => {
-                        eprintln!("Forwarding error from client: {}", e);
-                        break;
-                    }
-                }
-            }
-            result = target_socket.read(&mut target_buf) => {
-                match result {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        client_socket.write_all(&target_buf[..n]).await?;
-                    }
-                    Err(e) => {
-                        eprintln!("Forwarding error from target: {}", e);
-                        break;
+    match peek_stream(&client_stream) {
+        Ok(data_str) => {
+            if data_str.contains("HTTP") {
+                let _ = client_stream.read(&mut vec![0; 1024]);
+                let payload_str = data_str.to_lowercase();
+                if payload_str.contains("websocket") || payload_str.contains("ws") {
+                    if client_stream.write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes()).is_err() {
+                        return;
                     }
                 }
             }
         }
+        Err(..) => return,
     }
 
-    Ok(())
+    let addr_proxy = if peek_stream(&client_stream).map_or(false, |data_str| data_str.starts_with("SSH")) {
+        "0.0.0.0:22".to_string()
+    } else {
+        "0.0.0.0:1194".to_string()
+    };
+
+    let server_connect = TcpStream::connect(&addr_proxy);
+    if server_connect.is_err() {
+        return;
+    }
+
+    let server_stream = server_connect.unwrap();
+
+    let (mut client_read, mut client_write) = (client_stream.try_clone().unwrap(), client_stream.try_clone().unwrap());
+    let (mut server_read, mut server_write) = (server_stream.try_clone().unwrap(), server_stream);
+
+    thread::spawn(move || {
+        transfer_data(&mut client_read, &mut server_write);
+    });
+
+    thread::spawn(move || {
+        transfer_data(&mut server_read, &mut client_write);
+    });
+}
+
+fn transfer_data(read_stream: &mut TcpStream, write_stream: &mut TcpStream) {
+    let mut buffer = [0; 2048];
+    loop {
+        match read_stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                if write_stream.write_all(&buffer[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = write_stream.shutdown(Shutdown::Both);
+}
+
+fn peek_stream(read_stream: &TcpStream) -> Result<String, Error> {
+    let mut peek_buffer = vec![0; 1024];
+    let bytes_peeked = read_stream.peek(&mut peek_buffer)?;
+    let data = &peek_buffer[..bytes_peeked];
+    let data_str = String::from_utf8_lossy(data);
+    Ok(data_str.to_string())
+}
+
+fn get_port() -> u16 {
+    let args: Vec<String> = env::args().collect();
+    let mut port = 80; // Valor padrão
+
+    for i in 1..args.len() {
+        if args[i] == "--port" {
+            if i + 1 < args.len() {
+                port = args[i + 1].parse().unwrap_or(80);
+            }
+        }
+    }
+
+    port
+}
+
+fn get_status() -> String {
+    let args: Vec<String> = env::args().collect();
+    let mut status = String::from("@RustyManager"); // Valor padrão
+
+    for i in 1..args.len() {
+        if args[i] == "--status" {
+            if i + 1 < args.len() {
+                status = args[i + 1].clone();
+            }
+        }
+    }
+
+    status
 }
