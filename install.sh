@@ -87,8 +87,8 @@ else
     # ---->>>> Instalar o RustyProxy
     show_progress "Compilando RustyProxy, isso pode levar algum tempo dependendo da maquina..."
 
-    if [ -d "/root/RustyProxy" ]; then
-        rm -rf /root/RustyProxy
+    if [ -d "/root/RustyProxyOnly" ]; then
+        rm -rf /root/RustyProxyOnly
     fi
 
 

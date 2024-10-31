@@ -9,9 +9,7 @@
   <component name="ChangeListManager">
     <list default="true" id="bb3bf3d2-3c11-44c4-9a1f-de58337f3b1a" name="Changes" comment="new update">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/RustyProxy/Cargo.lock" beforeDir="false" afterPath="$PROJECT_DIR$/RustyProxy/Cargo.lock" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/RustyProxy/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/RustyProxy/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/RustyProxy/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/RustyProxy/src/main.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/install.sh" beforeDir="false" afterPath="$PROJECT_DIR$/install.sh" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -20,6 +18,7 @@
   </component>
   <component name="ExecutionTargetManager" SELECTED_TARGET="RsBuildProfile:dev" />
   <component name="Git.Settings">
+    <option name="PUSH_AUTO_UPDATE" value="true" />
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
   <component name="GitHubPullRequestSearchHistory"><![CDATA[{
@@ -113,7 +112,7 @@
       <updated>1728830311077</updated>
       <workItem from="1728830312118" duration="5668000" />
       <workItem from="1728906810758" duration="78000" />
-      <workItem from="1730321753876" duration="7395000" />
+      <workItem from="1730321753876" duration="9888000" />
     </task>
     <task id="LOCAL-00001" summary="new update">
       <option name="closed" value="true" />
@@ -139,7 +138,15 @@
       <option name="project" value="LOCAL" />
       <updated>1730322510006</updated>
     </task>
-    <option name="localTasksCounter" value="4" />
+    <task id="LOCAL-00004" summary="new update">
+      <option name="closed" value="true" />
+      <created>1730331803690</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1730331803690</updated>
+    </task>
+    <option name="localTasksCounter" value="5" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
