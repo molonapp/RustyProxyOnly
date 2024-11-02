@@ -1,10 +1,12 @@
 use std::io::{Error, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::mpsc;
+use std::time::Duration;
 use std::{env, thread};
 
 fn main() {
     // Iniciando o proxy
-    let listener = TcpListener::bind(format!("[::]:{}", get_port())).unwrap();
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", get_port())).unwrap();
     start_http(listener);
 }
 
@@ -44,11 +46,34 @@ fn handle_client(client_stream: &mut TcpStream) {
         Err(..) => return,
     }
 
-    let addr_proxy = if peek_stream(&client_stream).map_or(false, |data_str| data_str.starts_with("SSH")) {
-        "0.0.0.0:22".to_string()
-    } else {
-        "0.0.0.0:1194".to_string()
-    };
+
+    let mut addr_proxy = "0.0.0.0:22";
+
+    let (tx, rx) = mpsc::channel();
+
+    let clone_client = client_stream.try_clone().unwrap();
+    let read_handle = thread::spawn(move || {
+        let result = peek_stream(&clone_client);
+        tx.send(result).ok();
+    });
+
+    let read_result = rx.recv_timeout(Duration::from_secs(1));
+
+    match read_result {
+        Ok(Ok(data_str)) => {
+            if !data_str.contains("SSH") {
+                addr_proxy = "0.0.0.0:1194";
+            }
+        }
+        Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Timeout) => {
+            read_handle.thread().unpark()
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            read_handle.thread().unpark()
+        }
+    }
+    let _ = read_handle.thread();
+
 
     let server_connect = TcpStream::connect(&addr_proxy);
     if server_connect.is_err() {
@@ -82,7 +107,7 @@ fn transfer_data(read_stream: &mut TcpStream, write_stream: &mut TcpStream) {
             Err(_) => break,
         }
     }
-    let _ = write_stream.shutdown(Shutdown::Both);
+    write_stream.shutdown(Shutdown::Both).ok();
 }
 
 fn peek_stream(read_stream: &TcpStream) -> Result<String, Error> {
