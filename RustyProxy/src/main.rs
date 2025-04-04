@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, sleep, Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -40,9 +40,17 @@ async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
                      Sec-WebSocket-Accept: dGhpcyBpcyBhIGZha2UgaGFuZHNoYWtl\r\n\
                      \r\n";
     
-    let _ = client_stream.write_all(handshake.as_bytes()).await;
+    client_stream.write_all(handshake.as_bytes()).await?;
 
-    // Ignora payloads malformadas, apenas faz proxy
+    // Mantém conexão ativa enviando "pong" a cada 500ms
+    let keep_alive = async {
+        loop {
+            let _ = client_stream.write_all(&[0x89, 0x00]).await; // Frame PONG
+            sleep(Duration::from_millis(500)).await;
+        }
+    };
+
+    // Roteia conexão para o destino correto (SSH ou OpenVPN)
     let addr_proxy = match timeout(Duration::from_secs(1), peek_stream(&mut client_stream)).await {
         Ok(Ok(data)) if data.contains("SSH") || data.is_empty() => "0.0.0.0:22",
         _ => "0.0.0.0:1194",
@@ -63,8 +71,14 @@ async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
 
     let t1 = transfer_data(client_read, server_write);
     let t2 = transfer_data(server_read, client_write);
+    let t3 = keep_alive;
 
-    tokio::try_join!(t1, t2)?;
+    tokio::select! {
+        _ = t1 => (),
+        _ = t2 => (),
+        _ = t3 => (),
+    }
+
     Ok(())
 }
 
