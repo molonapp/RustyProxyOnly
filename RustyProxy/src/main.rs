@@ -1,14 +1,15 @@
 use std::env;
 use std::io::Error;
-use std::net::UdpSocket;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration};
+use tokio::{time::{Duration}};
+use tokio::time::timeout;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    // Iniciando o proxy
     let port = get_port();
     let listener = TcpListener::bind(format!("[::]:{}", port)).await?;
     println!("Iniciando serviço na porta: {}", port);
@@ -26,7 +27,9 @@ async fn start_http(listener: TcpListener) {
                     }
                 });
             }
-            Err(e) => println!("Erro ao aceitar conexão: {}", e),
+            Err(e) => {
+                println!("Erro ao aceitar conexão: {}", e);
+            }
         }
     }
 }
@@ -38,30 +41,37 @@ async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
         .await?;
 
     let mut buffer = vec![0; 1024];
-    let bytes_read = client_stream.read(&mut buffer).await?;
+    client_stream.read(&mut buffer).await?;
+    client_stream
+        .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes())
+        .await?;
 
-    if bytes_read == 0 {
-        return Err(Error::new(std::io::ErrorKind::UnexpectedEof, "EOF recebido"));
+    let mut addr_proxy = "0.0.0.0:22";
+    let result = timeout(Duration::from_secs(3), peek_stream(&mut client_stream)).await
+        .unwrap_or_else(|_| Ok(String::new()));
+
+    if let Ok(data) = result {
+        if data.contains("SSH") || data.is_empty() {
+            addr_proxy = "0.0.0.0:22";
+        } else {
+            addr_proxy = "0.0.0.0:1194";
+        }
+    } else {
+        addr_proxy = "0.0.0.0:22";
     }
 
-    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-    println!("Recebida requisição: {}", request);
+    let server_connect = TcpStream::connect(addr_proxy).await;
+    if server_connect.is_err() {
+        println!("erro ao iniciar conexão para o proxy ");
+        return Ok(());
+    }
 
-    let udp_port = extract_udp_port(&request).unwrap_or(7100);
-    println!("Encaminhando dados para porta UDP {}", udp_port);
 
-    let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
-    let _ = udp_socket.send_to(&buffer[..bytes_read], format!("127.0.0.1:{}", udp_port));
 
-    let server_addr = if request.contains("SSH") || request.is_empty() {
-        "127.0.0.1:22"
-    } else {
-        "127.0.0.1:1194"
-    };
+    let server_stream = server_connect?;
 
-    let server_connect = TcpStream::connect(server_addr).await?;
     let (client_read, client_write) = client_stream.into_split();
-    let (server_read, server_write) = server_connect.into_split();
+    let (server_read, server_write) = server_stream.into_split();
 
     let client_read = Arc::new(Mutex::new(client_read));
     let client_write = Arc::new(Mutex::new(client_write));
@@ -84,42 +94,55 @@ async fn transfer_data(
     loop {
         let bytes_read = {
             let mut read_guard = read_stream.lock().await;
-            match read_guard.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => break,
-            }
+            read_guard.read(&mut buffer).await?
         };
 
-        let mut write_guard = write_stream.lock().await;
-        if let Err(_) = write_guard.write_all(&buffer[..bytes_read]).await {
+        if bytes_read == 0 {
             break;
         }
+
+        let mut write_guard = write_stream.lock().await;
+        write_guard.write_all(&buffer[..bytes_read]).await?;
     }
+
     Ok(())
 }
 
-fn extract_udp_port(request: &str) -> Option<u16> {
-    let default_ports = [7100, 7200, 7800, 7900];
-    for port in default_ports {
-        if request.contains(&format!(":{} ", port)) {
-            return Some(port);
-        }
-    }
-    None
+async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
+    let mut peek_buffer = vec![0; 8192];
+    let bytes_peeked = stream.peek(&mut peek_buffer).await?;
+    let data = &peek_buffer[..bytes_peeked];
+    let data_str = String::from_utf8_lossy(data);
+    Ok(data_str.to_string())
 }
 
+
 fn get_port() -> u16 {
-    env::args()
-        .skip_while(|arg| arg != "--port")
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(80)
+    let args: Vec<String> = env::args().collect();
+    let mut port = 80;
+
+    for i in 1..args.len() {
+        if args[i] == "--port" {
+            if i + 1 < args.len() {
+                port = args[i + 1].parse().unwrap_or(80);
+            }
+        }
+    }
+
+    port
 }
 
 fn get_status() -> String {
-    env::args()
-        .skip_while(|arg| arg != "--status")
-        .nth(1)
-        .unwrap_or_else(|| "@RustyManager".to_string())
+    let args: Vec<String> = env::args().collect();
+    let mut status = String::from("@RustyManager");
+
+    for i in 1..args.len() {
+        if args[i] == "--status" {
+            if i + 1 < args.len() {
+                status = args[i + 1].clone();
+            }
+        }
+    }
+
+    status
 }
