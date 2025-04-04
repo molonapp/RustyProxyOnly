@@ -4,7 +4,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::time::{Duration, timeout};
+use tokio::time::{timeout, Duration};
+use sha1::{Sha1, Digest};
+use base64::{engine::general_purpose, Engine as _};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -33,29 +35,36 @@ async fn start_http(listener: TcpListener) {
 }
 
 async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
-    let status = get_status();
+    let mut buffer = vec![0; 2048];
+    let size = client_stream.read(&mut buffer).await?;
 
-    // Handshake HTTP para WebSocket
-    client_stream
-        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
-        .await?;
-
-    let mut addr_proxy = "0.0.0.0:22";
-
-    let result = timeout(Duration::from_secs(3), peek_stream(&mut client_stream)).await
-        .unwrap_or_else(|_| Ok(String::new()));
-
-    if let Ok(data) = result {
-        if data.contains("SSH") || data.is_empty() {
-            addr_proxy = "0.0.0.0:22";
-        } else {
-            addr_proxy = "0.0.0.0:1194";
-        }
+    if size == 0 {
+        return Ok(());
     }
+
+    let request = String::from_utf8_lossy(&buffer[..size]);
+    let sec_websocket_key = extract_sec_websocket_key(&request);
+    let response = if let Some(key) = sec_websocket_key {
+        let accept = generate_websocket_accept(&key);
+        format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {}\r\n\r\n",
+            accept
+        )
+    } else {
+        format!("HTTP/1.1 400 Bad Request\r\n\r\n")
+    };
+
+    client_stream.write_all(response.as_bytes()).await?;
+
+    // Direciona para a porta correta
+    let addr_proxy = "0.0.0.0:22"; // Ou detectar com peek se quiser
 
     let server_connect = TcpStream::connect(addr_proxy).await;
     if server_connect.is_err() {
-        println!("erro ao iniciar conexão para o proxy ");
+        println!("erro ao iniciar conexão para o proxy");
         return Ok(());
     }
 
@@ -99,12 +108,20 @@ async fn transfer_data(
     Ok(())
 }
 
-async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
-    let mut peek_buffer = vec![0; 8192];
-    let bytes_peeked = stream.peek(&mut peek_buffer).await?;
-    let data = &peek_buffer[..bytes_peeked];
-    let data_str = String::from_utf8_lossy(data);
-    Ok(data_str.to_string())
+fn extract_sec_websocket_key(request: &str) -> Option<String> {
+    for line in request.lines() {
+        if line.to_lowercase().starts_with("sec-websocket-key:") {
+            return Some(line["Sec-WebSocket-Key:".len()..].trim().to_string());
+        }
+    }
+    None
+}
+
+fn generate_websocket_accept(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key).as_bytes());
+    let result = hasher.finalize();
+    general_purpose::STANDARD.encode(result)
 }
 
 fn get_port() -> u16 {
@@ -120,19 +137,4 @@ fn get_port() -> u16 {
     }
 
     port
-}
-
-fn get_status() -> String {
-    let args: Vec<String> = env::args().collect();
-    let mut status = String::from("@RustyManager");
-
-    for i in 1..args.len() {
-        if args[i] == "--status" {
-            if i + 1 < args.len() {
-                status = args[i + 1].clone();
-            }
-        }
-    }
-
-    status
 }
