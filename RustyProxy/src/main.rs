@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -35,32 +35,13 @@ async fn start_http(listener: TcpListener) {
 async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
     let status = get_status();
 
-    // Envia o handshake inicial
+    // Handshake HTTP para WebSocket
     client_stream
         .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
         .await?;
 
-    // Aguarda dados do cliente — com proteção contra EOF
-    let mut buffer = vec![0; 1024];
-    let bytes_read = match client_stream.read(&mut buffer).await {
-        Ok(n) if n > 0 => n,
-        Ok(_) => {
-            println!("Cliente fechou a conexão após o handshake.");
-            return Ok(());
-        }
-        Err(e) => {
-            println!("Erro ao ler dados do cliente: {}", e);
-            return Ok(());
-        }
-    };
-
-    // Responde com 200 OK depois de receber algo
-    client_stream
-        .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes())
-        .await?;
-
-    // Detecta qual proxy usar
     let mut addr_proxy = "0.0.0.0:22";
+
     let result = timeout(Duration::from_secs(3), peek_stream(&mut client_stream)).await
         .unwrap_or_else(|_| Ok(String::new()));
 
