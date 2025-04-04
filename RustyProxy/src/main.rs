@@ -1,148 +1,71 @@
-use std::env;
-use std::io::Error;
-use std::sync::Arc;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::sync::{Arc};
 use tokio::sync::Mutex;
-use tokio::{time::{Duration}};
-use tokio::time::timeout;
 
 #[tokio::main]
-async fn main() -> Result<(), Error> {
-    // Iniciando o proxy
-    let port = get_port();
-    let listener = TcpListener::bind(format!("[::]:{}", port)).await?;
-    println!("Iniciando serviço na porta: {}", port);
-    start_http(listener).await;
-    Ok(())
-}
+async fn main() {
+    let listener = TcpListener::bind("0.0.0.0:7300").await.unwrap();
+    println!("[+] Aguardando conexão BadVPN na porta 7300");
 
-async fn start_http(listener: TcpListener) {
     loop {
-        match listener.accept().await {
-            Ok((client_stream, addr)) => {
-                tokio::spawn(async move {
-                    if let Err(e) = handle_client(client_stream).await {
-                        println!("Erro ao processar cliente {}: {}", addr, e);
-                    }
-                });
+        let (mut stream, addr) = listener.accept().await.unwrap();
+        println!("[+] Conectado de: {}", addr);
+        tokio::spawn(async move {
+            if let Err(e) = handle_badvpn_connection(&mut stream).await {
+                eprintln!("[x] Erro: {}", e);
             }
-            Err(e) => {
-                println!("Erro ao aceitar conexão: {}", e);
-            }
-        }
+        });
     }
 }
 
-async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
-    let status = get_status();
-    client_stream
-        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
-        .await?;
+async fn handle_badvpn_connection(stream: &mut TcpStream) -> tokio::io::Result<()> {
+    let mut conn_map: HashMap<u16, SocketAddr> = HashMap::new();
+    let mut udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let mut buf = [0u8; 1500];
 
-    let mut buffer = vec![0; 1024];
-    client_stream.read(&mut buffer).await?;
-    client_stream
-        .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes())
-        .await?;
-
-    let mut addr_proxy = "0.0.0.0:22";
-    let result = timeout(Duration::from_secs(3), peek_stream(&mut client_stream)).await
-        .unwrap_or_else(|_| Ok(String::new()));
-
-    if let Ok(data) = result {
-        if data.contains("SSH") || data.is_empty() {
-            addr_proxy = "0.0.0.0:22";
-        } else {
-            addr_proxy = "0.0.0.0:1194";
-        }
-    } else {
-        addr_proxy = "0.0.0.0:22";
-    }
-
-    let server_connect = TcpStream::connect(addr_proxy).await;
-    if server_connect.is_err() {
-        println!("erro ao iniciar conexão para o proxy ");
-        return Ok(());
-    }
-
-
-
-    let server_stream = server_connect?;
-
-    let (client_read, client_write) = client_stream.into_split();
-    let (server_read, server_write) = server_stream.into_split();
-
-    let client_read = Arc::new(Mutex::new(client_read));
-    let client_write = Arc::new(Mutex::new(client_write));
-    let server_read = Arc::new(Mutex::new(server_read));
-    let server_write = Arc::new(Mutex::new(server_write));
-
-    let client_to_server = transfer_data(client_read, server_write);
-    let server_to_client = transfer_data(server_read, client_write);
-
-    tokio::try_join!(client_to_server, server_to_client)?;
-
-    Ok(())
-}
-
-async fn transfer_data(
-    read_stream: Arc<Mutex<tokio::net::tcp::OwnedReadHalf>>,
-    write_stream: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-) -> Result<(), Error> {
-    let mut buffer = [0; 8192];
     loop {
-        let bytes_read = {
-            let mut read_guard = read_stream.lock().await;
-            read_guard.read(&mut buffer).await?
+        let n = match stream.read(&mut buf).await {
+            Ok(0) => return Ok(()), // EOF
+            Ok(n) => n,
+            Err(e) => return Err(e),
         };
 
-        if bytes_read == 0 {
-            break;
-        }
+        if n < 12 { continue; } // frame mínimo
 
-        let mut write_guard = write_stream.lock().await;
-        write_guard.write_all(&buffer[..bytes_read]).await?;
-    }
+        let conn_id = u16::from_be_bytes([buf[0], buf[1]]);
+        let _flags = u16::from_be_bytes([buf[2], buf[3]]);
+        let ip_len = u16::from_be_bytes([buf[4], buf[5]]) as usize;
 
-    Ok(())
-}
+        if n < 12 + ip_len { continue; }
 
-async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
-    let mut peek_buffer = vec![0; 8192];
-    let bytes_peeked = stream.peek(&mut peek_buffer).await?;
-    let data = &peek_buffer[..bytes_peeked];
-    let data_str = String::from_utf8_lossy(data);
-    Ok(data_str.to_string())
-}
+        let ip_bytes = &buf[6..6+ip_len];
+        let ip_str = ip_bytes.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(".");
+        let port = u16::from_be_bytes([buf[6+ip_len], buf[6+ip_len+1]]);
+        let payload = &buf[6+ip_len+2..n];
 
+        let target = format!("{}:{}", ip_str, port);
+        let target_addr: SocketAddr = target.parse().unwrap();
 
-fn get_port() -> u16 {
-    let args: Vec<String> = env::args().collect();
-    let mut port = 80;
+        conn_map.insert(conn_id, target_addr);
+        udp_socket.send_to(payload, target_addr).await?;
 
-    for i in 1..args.len() {
-        if args[i] == "--port" {
-            if i + 1 < args.len() {
-                port = args[i + 1].parse().unwrap_or(80);
-            }
-        }
-    }
-
-    port
-}
-
-fn get_status() -> String {
-    let args: Vec<String> = env::args().collect();
-    let mut status = String::from("@RustyManager");
-
-    for i in 1..args.len() {
-        if args[i] == "--status" {
-            if i + 1 < args.len() {
-                status = args[i + 1].clone();
-            }
+        // aguarda resposta UDP
+        let mut resp_buf = [0u8; 1500];
+        match tokio::time::timeout(std::time::Duration::from_millis(500), udp_socket.recv_from(&mut resp_buf)).await {
+            Ok(Ok((resp_len, _))) => {
+                let mut response = Vec::new();
+                response.extend_from_slice(&conn_id.to_be_bytes());
+                response.extend_from_slice(&[0x00, 0x00]);
+                response.extend_from_slice(&(4u16.to_be_bytes()));
+                response.extend_from_slice(&ip_bytes);
+                response.extend_from_slice(&port.to_be_bytes());
+                response.extend_from_slice(&resp_buf[..resp_len]);
+                stream.write_all(&response).await?;
+            },
+            _ => continue,
         }
     }
-
-    status
 }
