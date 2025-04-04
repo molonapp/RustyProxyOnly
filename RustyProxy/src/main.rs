@@ -4,12 +4,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::{time::{Duration}};
-use tokio::time::timeout;
+use tokio::time::{timeout, Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    // Iniciando o proxy
     let port = get_port();
     let listener = TcpListener::bind(format!("[::]:{}", port)).await?;
     println!("Iniciando serviço na porta: {}", port);
@@ -33,68 +31,68 @@ async fn start_http(listener: TcpListener) {
         }
     }
 }
-async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
-    let mut addr_proxy = "0.0.0.0:22";
-    let mut initial_data = Vec::new();
 
-    // Tenta detectar WebSocket
+async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
+    let status = get_status();
+
+    // Envia o handshake inicial
+    client_stream
+        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
+        .await?;
+
+    // Aguarda dados do cliente — com proteção contra EOF
+    let mut buffer = vec![0; 1024];
+    let bytes_read = match client_stream.read(&mut buffer).await {
+        Ok(n) if n > 0 => n,
+        Ok(_) => {
+            println!("Cliente fechou a conexão após o handshake.");
+            return Ok(());
+        }
+        Err(e) => {
+            println!("Erro ao ler dados do cliente: {}", e);
+            return Ok(());
+        }
+    };
+
+    // Responde com 200 OK depois de receber algo
+    client_stream
+        .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes())
+        .await?;
+
+    // Detecta qual proxy usar
+    let mut addr_proxy = "0.0.0.0:22";
     let result = timeout(Duration::from_secs(3), peek_stream(&mut client_stream)).await
         .unwrap_or_else(|_| Ok(String::new()));
 
     if let Ok(data) = result {
-        if data.contains("Upgrade: websocket") || data.contains("GET") {
-            // Handshake básico para WebSocket (simplificado)
-            let response = "HTTP/1.1 101 Switching Protocols\r\n\
-                            Upgrade: websocket\r\n\
-                            Connection: Upgrade\r\n\
-                            \r\n";
-            client_stream.write_all(response.as_bytes()).await?;
+        if data.contains("SSH") || data.is_empty() {
+            addr_proxy = "0.0.0.0:22";
+        } else {
             addr_proxy = "0.0.0.0:1194";
         }
-
-        // Lê os dados reais agora (consome o buffer)
-        let mut temp_buf = vec![0; 8192];
-        let bytes_read = client_stream.read(&mut temp_buf).await?;
-        if bytes_read > 0 {
-            initial_data.extend_from_slice(&temp_buf[..bytes_read]);
-        }
     }
 
-    let server_stream = TcpStream::connect(addr_proxy).await?;
-    let (mut client_read, mut client_write) = client_stream.into_split();
-    let (mut server_read, mut server_write) = server_stream.into_split();
-
-    // Repassa dados iniciais do cliente (úteis se ele mandou algo junto do upgrade)
-    if !initial_data.is_empty() {
-        server_write.write_all(&initial_data).await?;
+    let server_connect = TcpStream::connect(addr_proxy).await;
+    if server_connect.is_err() {
+        println!("erro ao iniciar conexão para o proxy ");
+        return Ok(());
     }
 
-    // Comunicação bidirecional normal
-    let client_to_server = tokio::spawn(async move {
-        let mut buffer = [0; 8192];
-        loop {
-            let bytes_read = client_read.read(&mut buffer).await?;
-            if bytes_read == 0 {
-                break;
-            }
-            server_write.write_all(&buffer[..bytes_read]).await?;
-        }
-        Ok::<(), Error>(())
-    });
+    let server_stream = server_connect?;
 
-    let server_to_client = tokio::spawn(async move {
-        let mut buffer = [0; 8192];
-        loop {
-            let bytes_read = server_read.read(&mut buffer).await?;
-            if bytes_read == 0 {
-                break;
-            }
-            client_write.write_all(&buffer[..bytes_read]).await?;
-        }
-        Ok::<(), Error>(())
-    });
+    let (client_read, client_write) = client_stream.into_split();
+    let (server_read, server_write) = server_stream.into_split();
 
-    let _ = tokio::try_join!(client_to_server, server_to_client)?;
+    let client_read = Arc::new(Mutex::new(client_read));
+    let client_write = Arc::new(Mutex::new(client_write));
+    let server_read = Arc::new(Mutex::new(server_read));
+    let server_write = Arc::new(Mutex::new(server_write));
+
+    let client_to_server = transfer_data(client_read, server_write);
+    let server_to_client = transfer_data(server_read, client_write);
+
+    tokio::try_join!(client_to_server, server_to_client)?;
+
     Ok(())
 }
 
@@ -127,7 +125,6 @@ async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
     let data_str = String::from_utf8_lossy(data);
     Ok(data_str.to_string())
 }
-
 
 fn get_port() -> u16 {
     let args: Vec<String> = env::args().collect();
