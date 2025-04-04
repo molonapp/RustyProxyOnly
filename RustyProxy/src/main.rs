@@ -5,8 +5,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
-use sha1::{Sha1, Digest};
-use base64::{engine::general_purpose, Engine as _};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -35,36 +33,29 @@ async fn start_http(listener: TcpListener) {
 }
 
 async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
-    let mut buffer = vec![0; 2048];
-    let size = client_stream.read(&mut buffer).await?;
+    let status = get_status();
 
-    if size == 0 {
-        return Ok(());
-    }
+    // Envia status para o cliente
+    let _ = client_stream
+        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
+        .await;
 
-    let request = String::from_utf8_lossy(&buffer[..size]);
-    let sec_websocket_key = extract_sec_websocket_key(&request);
-    let response = if let Some(key) = sec_websocket_key {
-        let accept = generate_websocket_accept(&key);
-        format!(
-            "HTTP/1.1 101 Switching Protocols\r\n\
-             Upgrade: websocket\r\n\
-             Connection: Upgrade\r\n\
-             Sec-WebSocket-Accept: {}\r\n\r\n",
-            accept
-        )
-    } else {
-        format!("HTTP/1.1 400 Bad Request\r\n\r\n")
+    // Tenta fazer o peek nos dados sem fechar a conexão se falhar
+    let data = match timeout(Duration::from_secs(3), peek_stream(&mut client_stream)).await {
+        Ok(Ok(data)) => data,
+        _ => String::new(), // se falhar, assume como vazio
     };
 
-    client_stream.write_all(response.as_bytes()).await?;
-
-    // Direciona para a porta correta
-    let addr_proxy = "0.0.0.0:22"; // Ou detectar com peek se quiser
+    // Decide destino com base no conteúdo
+    let addr_proxy = if data.contains("SSH") || data.is_empty() {
+        "0.0.0.0:22"
+    } else {
+        "0.0.0.0:1194"
+    };
 
     let server_connect = TcpStream::connect(addr_proxy).await;
     if server_connect.is_err() {
-        println!("erro ao iniciar conexão para o proxy");
+        println!("Erro ao conectar com o destino: {}", addr_proxy);
         return Ok(());
     }
 
@@ -94,47 +85,45 @@ async fn transfer_data(
     loop {
         let bytes_read = {
             let mut read_guard = read_stream.lock().await;
-            read_guard.read(&mut buffer).await?
+            match read_guard.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            }
         };
 
-        if bytes_read == 0 {
+        let mut write_guard = write_stream.lock().await;
+        if write_guard.write_all(&buffer[..bytes_read]).await.is_err() {
             break;
         }
-
-        let mut write_guard = write_stream.lock().await;
-        write_guard.write_all(&buffer[..bytes_read]).await?;
     }
 
     Ok(())
 }
 
-fn extract_sec_websocket_key(request: &str) -> Option<String> {
-    for line in request.lines() {
-        if line.to_lowercase().starts_with("sec-websocket-key:") {
-            return Some(line["Sec-WebSocket-Key:".len()..].trim().to_string());
-        }
-    }
-    None
-}
-
-fn generate_websocket_accept(key: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key).as_bytes());
-    let result = hasher.finalize();
-    general_purpose::STANDARD.encode(result)
+async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
+    let mut peek_buffer = vec![0; 8192];
+    let bytes_peeked = stream.peek(&mut peek_buffer).await?;
+    let data = &peek_buffer[..bytes_peeked];
+    Ok(String::from_utf8_lossy(data).to_string())
 }
 
 fn get_port() -> u16 {
     let args: Vec<String> = env::args().collect();
-    let mut port = 80;
-
     for i in 1..args.len() {
-        if args[i] == "--port" {
-            if i + 1 < args.len() {
-                port = args[i + 1].parse().unwrap_or(80);
-            }
+        if args[i] == "--port" && i + 1 < args.len() {
+            return args[i + 1].parse().unwrap_or(80);
         }
     }
+    80
+}
 
-    port
+fn get_status() -> String {
+    let args: Vec<String> = env::args().collect();
+    for i in 1..args.len() {
+        if args[i] == "--status" && i + 1 < args.len() {
+            return args[i + 1].clone();
+        }
+    }
+    "@RustyManager".to_string()
 }
