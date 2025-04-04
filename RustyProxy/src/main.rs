@@ -33,43 +33,35 @@ async fn start_http(listener: TcpListener) {
         }
     }
 }
-
 async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
-    let status = get_status();
-    client_stream
-        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
-        .await?;
-
-    let mut buffer = vec![0; 1024];
-    //client_stream.read(&mut buffer).await?;
-    client_stream
-        .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes())
-        .await?;
-
     let mut addr_proxy = "0.0.0.0:22";
-    let result = timeout(Duration::from_secs(1), peek_stream(&mut client_stream)).await
+
+    // Tenta olhar o que o cliente mandou
+    let result = timeout(Duration::from_secs(3), peek_stream(&mut client_stream)).await
         .unwrap_or_else(|_| Ok(String::new()));
 
     if let Ok(data) = result {
-        if data.contains("SSH") || data.is_empty() {
-            addr_proxy = "0.0.0.0:22";
-        } else {
+        // Decide com base nos dados recebidos
+        if data.starts_with("GET") || data.starts_with("CONNECT") || data.contains("HTTP") {
+            // Cliente espera handshake HTTP
+            let status = get_status();
+            client_stream
+                .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
+                .await?;
             addr_proxy = "0.0.0.0:1194";
+        } else {
+            addr_proxy = "0.0.0.0:22";
         }
-    } else {
-        addr_proxy = "0.0.0.0:22";
     }
 
+    // Conecta ao destino
     let server_connect = TcpStream::connect(addr_proxy).await;
     if server_connect.is_err() {
         println!("erro ao iniciar conexão para o proxy ");
         return Ok(());
     }
 
-
-
     let server_stream = server_connect?;
-
     let (client_read, client_write) = client_stream.into_split();
     let (server_read, server_write) = server_stream.into_split();
 
