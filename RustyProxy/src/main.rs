@@ -1,5 +1,6 @@
 use std::env;
 use std::io::Error;
+use std::net::UdpSocket;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -10,7 +11,7 @@ use tokio::time::{timeout, Duration};
 async fn main() -> Result<(), Error> {
     let port = get_port();
     let listener = TcpListener::bind(format!("[::]:{}", port)).await?;
-    println!("Servidor iniciado na porta: {}", port);
+    println!("Iniciando serviço na porta: {}", port);
     start_http(listener).await;
     Ok(())
 }
@@ -25,41 +26,52 @@ async fn start_http(listener: TcpListener) {
                     }
                 });
             }
-            Err(e) => {
-                println!("Erro ao aceitar conexão: {}", e);
-            }
+            Err(e) => println!("Erro ao aceitar conexão: {}", e),
         }
     }
 }
 
 async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
-    client_stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n").await?;
-    
+    let status = get_status();
+    client_stream
+        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
+        .await?;
+
     let mut buffer = vec![0; 1024];
-    match client_stream.read(&mut buffer).await {
-        Ok(0) => return Err(Error::new(std::io::ErrorKind::UnexpectedEof, "EOF recebido")),
-        Ok(_) => {
-            client_stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
-        }
-        Err(e) => return Err(e),
+    let bytes_read = client_stream.read(&mut buffer).await?;
+
+    if bytes_read == 0 {
+        return Err(Error::new(std::io::ErrorKind::UnexpectedEof, "EOF recebido"));
     }
 
-    let addr_proxy = "0.0.0.0:22";
-    let server_stream = TcpStream::connect(addr_proxy).await?;
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    println!("Recebida requisição: {}", request);
 
+    let udp_port = extract_udp_port(&request).unwrap_or(7100);
+    println!("Encaminhando dados para porta UDP {}", udp_port);
+
+    let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
+    let _ = udp_socket.send_to(&buffer[..bytes_read], format!("127.0.0.1:{}", udp_port));
+
+    let server_addr = if request.contains("SSH") || request.is_empty() {
+        "127.0.0.1:22"
+    } else {
+        "127.0.0.1:1194"
+    };
+
+    let server_connect = TcpStream::connect(server_addr).await?;
     let (client_read, client_write) = client_stream.into_split();
-    let (server_read, server_write) = server_stream.into_split();
+    let (server_read, server_write) = server_connect.into_split();
 
     let client_read = Arc::new(Mutex::new(client_read));
     let client_write = Arc::new(Mutex::new(client_write));
     let server_read = Arc::new(Mutex::new(server_read));
     let server_write = Arc::new(Mutex::new(server_write));
 
-    let client_to_server = transfer_data(client_read.clone(), server_write.clone());
-    let server_to_client = transfer_data(server_read.clone(), client_write.clone());
-    let keep_alive = keep_connection_alive(client_write.clone());
+    let client_to_server = transfer_data(client_read, server_write);
+    let server_to_client = transfer_data(server_read, client_write);
 
-    tokio::try_join!(client_to_server, server_to_client, keep_alive)?;
+    tokio::try_join!(client_to_server, server_to_client)?;
 
     Ok(())
 }
@@ -73,30 +85,41 @@ async fn transfer_data(
         let bytes_read = {
             let mut read_guard = read_stream.lock().await;
             match read_guard.read(&mut buffer).await {
-                Ok(0) => return Err(Error::new(std::io::ErrorKind::UnexpectedEof, "EOF recebido")),
+                Ok(0) => break,
                 Ok(n) => n,
-                Err(_) => return Ok(()),
+                Err(_) => break,
             }
         };
-        let mut write_guard = write_stream.lock().await;
-        write_guard.write_all(&buffer[..bytes_read]).await?;
-    }
-}
 
-async fn keep_connection_alive(write_stream: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>) -> Result<(), Error> {
-    loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
         let mut write_guard = write_stream.lock().await;
-        if write_guard.write_all(b"PING\r\n").await.is_err() {
-            return Err(Error::new(std::io::ErrorKind::BrokenPipe, "Conexão perdida"));
+        if let Err(_) = write_guard.write_all(&buffer[..bytes_read]).await {
+            break;
         }
     }
+    Ok(())
+}
+
+fn extract_udp_port(request: &str) -> Option<u16> {
+    let default_ports = [7100, 7200, 7800, 7900];
+    for port in default_ports {
+        if request.contains(&format!(":{} ", port)) {
+            return Some(port);
+        }
+    }
+    None
 }
 
 fn get_port() -> u16 {
-    let args: Vec<String> = env::args().collect();
-    args.iter()
-        .position(|x| x == "--port")
-        .and_then(|i| args.get(i + 1).and_then(|p| p.parse().ok()))
+    env::args()
+        .skip_while(|arg| arg != "--port")
+        .nth(1)
+        .and_then(|s| s.parse().ok())
         .unwrap_or(80)
+}
+
+fn get_status() -> String {
+    env::args()
+        .skip_while(|arg| arg != "--status")
+        .nth(1)
+        .unwrap_or_else(|| "@RustyManager".to_string())
 }
