@@ -11,17 +11,17 @@ async fn main() -> Result<(), Error> {
     let port = get_port();
     let listener = TcpListener::bind(format!("[::]:{}", port)).await?;
     println!("Iniciando serviço na porta: {}", port);
-    start_http(listener).await;
+    start_proxy(listener).await;
     Ok(())
 }
 
-async fn start_http(listener: TcpListener) {
+async fn start_proxy(listener: TcpListener) {
     loop {
         match listener.accept().await {
             Ok((client_stream, addr)) => {
                 tokio::spawn(async move {
                     if let Err(e) = handle_client(client_stream).await {
-                        println!("Erro ao processar cliente {}: {}", addr, e);
+                        println!("Erro com cliente {}: {}", addr, e);
                     }
                 });
             }
@@ -33,51 +33,24 @@ async fn start_http(listener: TcpListener) {
 }
 
 async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
-    let status = get_status();
+    // ** Responde um WebSocket 101 Switching Protocols **
+    let handshake = "HTTP/1.1 101 Switching Protocols\r\n\
+                     Upgrade: websocket\r\n\
+                     Connection: Upgrade\r\n\
+                     Sec-WebSocket-Accept: dGhpcyBpcyBhIGZha2UgaGFuZHNoYWtl\r\n\
+                     \r\n";
+    
+    let _ = client_stream.write_all(handshake.as_bytes()).await;
 
-    if let Err(e) = client_stream
-        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
-        .await
-    {
-        println!("Falha no handshake HTTP: {}", e);
-        return Ok(());
-    }
-
-    let mut buffer = vec![0; 1024];
-    match client_stream.read(&mut buffer).await {
-        Ok(0) => {
-            println!("Cliente fechou conexão antes de enviar dados.");
-            return Ok(());
-        }
-        Ok(_) => { /* Podemos ignorar o conteúdo se for malformado */ }
-        Err(e) => {
-            println!("Erro ao ler payload inicial: {}", e);
-            return Ok(());
-        }
-    }
-
-    let _ = client_stream
-        .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes())
-        .await;
-
-    let mut addr_proxy = "0.0.0.0:22";
-    let result = timeout(Duration::from_secs(1), peek_stream(&mut client_stream)).await
-        .unwrap_or_else(|_| Ok(String::new()));
-
-    if let Ok(data) = result {
-        if data.contains("SSH") || data.is_empty() {
-            addr_proxy = "0.0.0.0:22";
-        } else {
-            addr_proxy = "0.0.0.0:1194";
-        }
-    }
+    // Ignora payloads malformadas, apenas faz proxy
+    let addr_proxy = match timeout(Duration::from_secs(1), peek_stream(&mut client_stream)).await {
+        Ok(Ok(data)) if data.contains("SSH") || data.is_empty() => "0.0.0.0:22",
+        _ => "0.0.0.0:1194",
+    };
 
     let server_stream = match TcpStream::connect(addr_proxy).await {
         Ok(s) => s,
-        Err(e) => {
-            println!("Falha ao conectar com o proxy backend: {}", e);
-            return Ok(());
-        }
+        Err(_) => return Ok(()),
     };
 
     let (client_read, client_write) = client_stream.into_split();
@@ -88,80 +61,48 @@ async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
     let server_read = Arc::new(Mutex::new(server_read));
     let server_write = Arc::new(Mutex::new(server_write));
 
-    let client_to_server = transfer_data(client_read.clone(), server_write.clone());
-    let server_to_client = transfer_data(server_read.clone(), client_write.clone());
+    let t1 = transfer_data(client_read, server_write);
+    let t2 = transfer_data(server_read, client_write);
 
-    tokio::select! {
-        r1 = client_to_server => {
-            if let Err(e) = r1 {
-                println!("Erro na transmissão cliente -> servidor: {}", e);
-            }
-        }
-        r2 = server_to_client => {
-            if let Err(e) = r2 {
-                println!("Erro na transmissão servidor -> cliente: {}", e);
-            }
-        }
-    }
-
+    tokio::try_join!(t1, t2)?;
     Ok(())
 }
 
 async fn transfer_data(
-    read_stream: Arc<Mutex<tokio::net::tcp::OwnedReadHalf>>,
-    write_stream: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    read: Arc<Mutex<tokio::net::tcp::OwnedReadHalf>>,
+    write: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
 ) -> Result<(), Error> {
     let mut buffer = [0; 8192];
     loop {
         let bytes_read = {
-            let mut read_guard = read_stream.lock().await;
-            read_guard.read(&mut buffer).await?
+            let mut reader = read.lock().await;
+            reader.read(&mut buffer).await?
         };
 
         if bytes_read == 0 {
             break;
         }
 
-        let mut write_guard = write_stream.lock().await;
-        write_guard.write_all(&buffer[..bytes_read]).await?;
+        let mut writer = write.lock().await;
+        writer.write_all(&buffer[..bytes_read]).await?;
     }
-
     Ok(())
 }
 
 async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
-    let mut peek_buffer = vec![0; 8192];
-    let bytes_peeked = stream.peek(&mut peek_buffer).await?;
-    let data = &peek_buffer[..bytes_peeked];
-    Ok(String::from_utf8_lossy(data).to_string())
+    let mut peek_buf = [0u8; 1024];
+    let n = stream.peek(&mut peek_buf).await?;
+    Ok(String::from_utf8_lossy(&peek_buf[..n]).to_string())
 }
 
 fn get_port() -> u16 {
     let args: Vec<String> = env::args().collect();
-    let mut port = 80;
-
     for i in 1..args.len() {
         if args[i] == "--port" {
             if i + 1 < args.len() {
-                port = args[i + 1].parse().unwrap_or(80);
+                return args[i + 1].parse().unwrap_or(80);
             }
         }
     }
-
-    port
-}
-
-fn get_status() -> String {
-    let args: Vec<String> = env::args().collect();
-    let mut status = String::from("@RustyManager");
-
-    for i in 1..args.len() {
-        if args[i] == "--status" {
-            if i + 1 < args.len() {
-                status = args[i + 1].clone();
-            }
-        }
-    }
-
-    status
+    80
 }
