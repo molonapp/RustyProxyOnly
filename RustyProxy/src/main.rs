@@ -1,190 +1,125 @@
 use std::env;
 use std::io::Error;
-use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
-use tokio::time::{Duration, timeout};
+use tokio::time::{timeout, Duration};
 
-// Estrutura para centralizar configurações
+/// Configuração via linha de comando
 struct Config {
-    listen_port: u16,   // Porta onde o proxy escuta
-    ssh_port: u16,      // Porta para encaminhar SSH
-    openvpn_port: u16,  // Porta para encaminhar OpenVPN
-    status: String,     // Mensagem de status
+    listen_port: u16,
+    ssh_port: u16,
+    openvpn_port: u16,
+    status: String,
 }
 
 impl Config {
-    // Cria uma configuração a partir dos argumentos da linha de comando
     fn from_args() -> Self {
         let args: Vec<String> = env::args().collect();
-        let mut config = Config {
+        let mut cfg = Config {
             listen_port: 80,
             ssh_port: 22,
             openvpn_port: 1194,
-            status: String::from("@RustyManager"),
+            status: "@RustyManager".into(),
         };
-
         for i in 1..args.len() {
             match args[i].as_str() {
-                "--port" => {
-                    if i + 1 < args.len() {
-                        config.listen_port = args[i + 1].parse().unwrap_or(80);
-                    }
+                "--port" if i + 1 < args.len() => {
+                    cfg.listen_port = args[i + 1].parse().unwrap_or(80);
                 }
-                "--ssh-port" => {
-                    if i + 1 < args.len() {
-                        config.ssh_port = args[i + 1].parse().unwrap_or(22);
-                    }
+                "--ssh-port" if i + 1 < args.len() => {
+                    cfg.ssh_port = args[i + 1].parse().unwrap_or(22);
                 }
-                "--openvpn-port" => {
-                    if i + 1 < args.len() {
-                        config.openvpn_port = args[i + 1].parse().unwrap_or(1194);
-                    }
+                "--openvpn-port" if i + 1 < args.len() => {
+                    cfg.openvpn_port = args[i + 1].parse().unwrap_or(1194);
                 }
-                "--status" => {
-                    if i + 1 < args.len() {
-                        config.status = args[i + 1].clone();
-                    }
+                "--status" if i + 1 < args.len() => {
+                    cfg.status = args[i + 1].clone();
                 }
                 _ => {}
             }
         }
-        config
+        cfg
     }
 }
 
-// Enum para representar os protocolos suportados
-enum Protocolo {
-    SSH,
-    OpenVPN,
-    Desconhecido,
-}
+/// Protocolos suportados
+enum Protocolo { SSH, OpenVPN, Desconhecido }
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    // Iniciando o proxy com configurações
-    let config = Config::from_args();
-    let listener = TcpListener::bind(format!("[::]:{}", config.listen_port)).await?;
-    println!("Iniciando serviço na porta: {}", config.listen_port);
-    start_http(listener).await;
-    Ok(())
-}
-
-async fn start_http(listener: TcpListener) {
+    let cfg = Config::from_args();
+    let listener = TcpListener::bind(format!("[::]:{}", cfg.listen_port)).await?;
+    println!("RustyProxy ouvindo na porta {}", cfg.listen_port);
     loop {
-        match listener.accept().await {
-            Ok((client_stream, addr)) => {
-                tokio::spawn(async move {
-                    if let Err(e) = handle_client(client_stream).await {
-                        println!("Erro ao processar cliente {}: {}", addr, e);
-                    }
-                });
+        let (stream, addr) = listener.accept().await?;
+        println!("Nova conexão de {}", addr);
+        let cfg = cfg.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_client(stream, cfg).await {
+                eprintln!("Erro ao processar {}: {}", addr, e);
             }
-            Err(e) => {
-                println!("Erro ao aceitar conexão: {}", e);
-            }
-        }
+        });
     }
 }
 
-async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
-    let config = Config::from_args();
-    
-    // Envia resposta inicial HTTP 101
-    client_stream
-        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", config.status).as_bytes())
+async fn handle_client(mut client: TcpStream, cfg: Config) -> Result<(), Error> {
+    // 1) Handshake HTTP simulado
+    client
+        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", cfg.status).as_bytes())
+        .await?;
+    client
+        .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", cfg.status).as_bytes())
         .await?;
 
-    let mut buffer = vec![0; 1024];
-    client_stream.read(&mut buffer).await?;
-    client_stream
-        .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", config.status).as_bytes())
-        .await?;
-
-    // Detecta o protocolo com timeout
-    let addr_proxy = match timeout(Duration::from_secs(1), detectar_protocolo(&client_stream)).await {
-        Ok(Protocolo::SSH) => format!("0.0.0.0:{}", config.ssh_port),
-        Ok(Protocolo::OpenVPN) => format!("0.0.0.0:{}", config.openvpn_port),
-        Ok(Protocolo::Desconhecido) | Err(_) => {
-            println!("Protocolo desconhecido ou timeout, usando SSH como fallback");
-            format!("0.0.0.0:{}", config.ssh_port)
-        }
+    // 2) Detecta protocolo em até 1s
+    let proto = match timeout(Duration::from_secs(1), peek(&mut client)).await {
+        Ok(Ok(txt)) if txt.starts_with("SSH-") || txt.is_empty() => Protocolo::SSH,
+        Ok(Ok(_)) => Protocolo::OpenVPN,
+        _ => Protocolo::Desconhecido,
     };
 
-    // Conecta ao servidor proxy com tratamento de erro detalhado
-    let server_stream = TcpStream::connect(&addr_proxy).await
-        .map_err(|e| {
-            println!("Erro ao conectar ao {} na porta {}: {}", 
-                if addr_proxy.contains(&config.ssh_port.to_string()) { "SSH" } else { "OpenVPN" }, 
-                addr_proxy, 
-                e);
-            e
-        })?;
+    let target = match proto {
+        Protocolo::SSH | Protocolo::Desconhecido => format!("127.0.0.1:{}", cfg.ssh_port),
+        Protocolo::OpenVPN => format!("127.0.0.1:{}", cfg.openvpn_port),
+    };
+    println!("Encaminhando tráfego para {}", target);
 
-    // Divide os streams para leitura e escrita
-    let (client_read, client_write) = client_stream.into_split();
-    let (server_read, server_write) = server_stream.into_split();
-
-    let client_read = Arc::new(Mutex::new(client_read));
-    let client_write = Arc::new(Mutex::new(client_write));
-    let server_read = Arc::new(Mutex::new(server_read));
-    let server_write = Arc::new(Mutex::new(server_write));
-
-    // Inicia a transferência bidirecional
-    let client_to_server = transfer_data(client_read, server_write);
-    let server_to_client = transfer_data(server_read, client_write);
-
-    tokio::try_join!(client_to_server, server_to_client)?;
+    // 3) Conecta ao destino e faz túnel bidirecional IMEDIATAMENTE
+    let mut server = TcpStream::connect(&target).await?;
+    copy_bidirectional(&mut client, &mut server).await?;
 
     Ok(())
 }
 
-async fn transfer_data(
-    read_stream: Arc<Mutex<tokio::net::tcp::OwnedReadHalf>>,
-    write_stream: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-) -> Result<(), Error> {
-    let mut buffer = [0; 8192];
-    loop {
-        let bytes_read = {
-            let mut read_guard = read_stream.lock().await;
-            read_guard.read(&mut buffer).await?
-        };
-
-        if bytes_read == 0 {
-            break;
-        }
-
-        let mut write_guard = write_stream.lock().await;
-        write_guard.write_all(&buffer[..bytes_read]).await?;
-    }
-
-    Ok(())
+async fn peek(stream: &mut TcpStream) -> Result<String, Error> {
+    let mut buf = [0u8; 512];
+    let n = stream.peek(&mut buf).await?;
+    Ok(String::from_utf8_lossy(&buf[..n]).to_string())
 }
 
-// Função para espiar o fluxo e detectar o protocolo
-async fn detectar_protocolo(stream: &TcpStream) -> Protocolo {
-    match peek_stream(stream).await {
-        Ok(data) => {
-            if data.starts_with("SSH-") { // Verificação específica para SSH
-                Protocolo::SSH
-            } else if !data.is_empty() { // Assume OpenVPN se não for SSH e houver dados
-                Protocolo::OpenVPN
-            } else {
-                Protocolo::Desconhecido
-            }
-        }
-        Err(e) => {
-            println!("Erro ao detectar protocolo: {}", e);
-            Protocolo::Desconhecido
-        }
-    }
+fn get_port() -> u16 {
+    env::args()
+        .skip_while(|a| a != "--port")
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(80)
 }
 
-async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
-    let mut peek_buffer = vec![0; 8192];
-    let bytes_peeked = stream.peek(&mut peek_buffer).await?;
-    let data = &peek_buffer[..bytes_peeked];
-    let data_str = String::from_utf8_lossy(data);
-    Ok(data_str.to_string())
+fn get_status() -> String {
+    env::args()
+        .skip_while(|a| a != "--status")
+        .nth(1)
+        .unwrap_or_else(|| "@RustyManager".into())
+}
+
+// Permitir clonar Config
+impl Clone for Config {
+    fn clone(&self) -> Self {
+        Config {
+            listen_port: self.listen_port,
+            ssh_port: self.ssh_port,
+            openvpn_port: self.openvpn_port,
+            status: self.status.clone(),
+        }
+    }
 }
