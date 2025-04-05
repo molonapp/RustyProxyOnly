@@ -4,12 +4,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::{time::{Duration}};
-use tokio::time::timeout;
+use tokio::time::{timeout, Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    // Iniciando o proxy
     let port = get_port();
     let listener = TcpListener::bind(format!("[::]:{}", port)).await?;
     println!("Iniciando serviço na porta: {}", port);
@@ -47,7 +45,7 @@ async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
         .await?;
 
     let mut addr_proxy = "0.0.0.0:22";
-    let result = timeout(Duration::from_secs(2), peek_stream(&mut client_stream)).await
+    let result = timeout(Duration::from_secs(1), peek_stream(&mut client_stream)).await
         .unwrap_or_else(|_| Ok(String::new()));
 
     if let Ok(data) = result {
@@ -66,8 +64,6 @@ async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
         return Ok(());
     }
 
-
-
     let server_stream = server_connect?;
 
     let (client_read, client_write) = client_stream.into_split();
@@ -78,8 +74,8 @@ async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
     let server_read = Arc::new(Mutex::new(server_read));
     let server_write = Arc::new(Mutex::new(server_write));
 
-    let client_to_server = transfer_data(client_read, server_write);
-    let server_to_client = transfer_data(server_read, client_write);
+    let client_to_server = transfer_data(client_read.clone(), server_write.clone());
+    let server_to_client = transfer_data(server_read.clone(), client_write.clone());
 
     tokio::try_join!(client_to_server, server_to_client)?;
 
@@ -91,36 +87,50 @@ async fn transfer_data(
     write_stream: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
 ) -> Result<(), Error> {
     let mut buffer = [0; 8192];
+
     loop {
         let bytes_read = {
-            let mut read_guard = read_stream.lock().await;
-            read_guard.read(&mut buffer).await?
+            let mut read = read_stream.lock().await;
+            match read.read(&mut buffer).await {
+                Ok(0) => return Ok(()), // EOF
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("Erro na leitura: {}", e);
+                    return Err(e);
+                }
+            }
         };
 
-        if bytes_read == 0 {
-            break;
+        {
+            let mut write = write_stream.lock().await;
+            if let Err(e) = write.write_all(&buffer[..bytes_read]).await {
+                eprintln!("Erro na escrita: {}", e);
+                return Err(e);
+            }
         }
 
-        let mut write_guard = write_stream.lock().await;
-        write_guard.write_all(&buffer[..bytes_read]).await?;
+        // Camuflagem: envia "ruído" leve se passar tempo sem envio
+        let write_clone = write_stream.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let mut fake = write_clone.lock().await;
+            let _ = fake.write_all(b" \n").await;
+        });
     }
-
-    Ok(())
 }
 
 async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
-    let mut peek_buffer = vec![0; 8192];
-    let bytes_peeked = stream.peek(&mut peek_buffer).await?;
-    let data = &peek_buffer[..bytes_peeked];
-    let data_str = String::from_utf8_lossy(data);
-    Ok(data_str.to_string())
+    let mut buffer = vec![0; 512];
+    let result = timeout(Duration::from_millis(300), stream.read(&mut buffer)).await;
+    match result {
+        Ok(Ok(n)) if n > 0 => Ok(String::from_utf8_lossy(&buffer[..n]).to_string()),
+        _ => Ok(String::new()),
+    }
 }
-
 
 fn get_port() -> u16 {
     let args: Vec<String> = env::args().collect();
     let mut port = 80;
-
     for i in 1..args.len() {
         if args[i] == "--port" {
             if i + 1 < args.len() {
@@ -128,14 +138,12 @@ fn get_port() -> u16 {
             }
         }
     }
-
     port
 }
 
 fn get_status() -> String {
     let args: Vec<String> = env::args().collect();
     let mut status = String::from("@RustyManager");
-
     for i in 1..args.len() {
         if args[i] == "--status" {
             if i + 1 < args.len() {
@@ -143,6 +151,5 @@ fn get_status() -> String {
             }
         }
     }
-
     status
 }
