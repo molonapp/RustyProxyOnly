@@ -11,11 +11,11 @@ async fn main() -> Result<(), Error> {
     let port = get_port();
     let listener = TcpListener::bind(format!("[::]:{}", port)).await?;
     println!("Iniciando serviço na porta: {}", port);
-    start_proxy(listener).await;
+    start_http(listener).await;
     Ok(())
 }
 
-async fn start_proxy(listener: TcpListener) {
+async fn start_http(listener: TcpListener) {
     loop {
         match listener.accept().await {
             Ok((client_stream, addr)) => {
@@ -33,25 +33,41 @@ async fn start_proxy(listener: TcpListener) {
 }
 
 async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
-    let mut addr_proxy = "127.0.0.1:22";
-    let result = timeout(Duration::from_millis(500), peek_stream(&mut client_stream)).await
+    let status = get_status();
+
+    // Camuflagem HTTP para fingir ser resposta web
+    let fake_http_response = format!(
+        "HTTP/1.1 200 {}\r\nContent-Type: text/html\r\nConnection: keep-alive\r\n\r\n",
+        status
+    );
+    client_stream.write_all(fake_http_response.as_bytes()).await?;
+
+    // Espera por uma "requisição" malformada, sem se importar com o conteúdo
+    let mut buffer = vec![0; 2048];
+    let _ = timeout(Duration::from_secs(2), client_stream.read(&mut buffer)).await;
+
+    // Decide qual proxy usar (22 ou 1194)
+    let mut addr_proxy = "0.0.0.0:22"; // padrão
+
+    let result = timeout(Duration::from_secs(1), peek_stream(&mut client_stream)).await
         .unwrap_or_else(|_| Ok(String::new()));
 
     if let Ok(data) = result {
         if data.contains("SSH") || data.is_empty() {
-            addr_proxy = "127.0.0.1:22";
+            addr_proxy = "0.0.0.0:22";
         } else {
-            addr_proxy = "127.0.0.1:1194";
+            addr_proxy = "0.0.0.0:1194";
         }
     }
 
     let server_connect = TcpStream::connect(addr_proxy).await;
     if server_connect.is_err() {
-        println!("Erro ao conectar no proxy: {}", addr_proxy);
+        println!("Erro ao conectar ao destino proxy");
         return Ok(());
     }
 
     let server_stream = server_connect?;
+
     let (client_read, client_write) = client_stream.into_split();
     let (server_read, server_write) = server_stream.into_split();
 
@@ -91,7 +107,7 @@ async fn transfer_data(
 }
 
 async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
-    let mut peek_buffer = vec![0; 512];
+    let mut peek_buffer = vec![0; 8192];
     let bytes_peeked = stream.peek(&mut peek_buffer).await?;
     let data = &peek_buffer[..bytes_peeked];
     let data_str = String::from_utf8_lossy(data);
