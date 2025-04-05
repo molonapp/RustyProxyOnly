@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration, timeout};
+use tokio::time::{timeout, Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -35,15 +35,16 @@ async fn start_http(listener: TcpListener) {
 async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
     let status = get_status();
 
-    // Resposta falsa com headers e padding
-    let fake_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 120\r\nConnection: keep-alive\r\n\r\n<html><body><h1>{}</h1><p>Bem-vindo</p><p>...</p></body></html>\r\n\r\n",
-        status
+    // Envia resposta HTTP chunked falsa
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
     );
+    client_stream.write_all(response.as_bytes()).await?;
 
-    client_stream.write_all(fake_response.as_bytes()).await?;
-    sleep(Duration::from_secs(5)).await; // Delay para DPI não detectar
+    // Aguarda 5 segundos antes de iniciar o tunelamento
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
+    // Decide o destino baseado na requisição
     let mut addr_proxy = "0.0.0.0:22";
     let result = timeout(Duration::from_secs(1), peek_stream(&mut client_stream)).await
         .unwrap_or_else(|_| Ok(String::new()));
@@ -54,13 +55,11 @@ async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
         } else {
             addr_proxy = "0.0.0.0:1194";
         }
-    } else {
-        addr_proxy = "0.0.0.0:22";
     }
 
     let server_connect = TcpStream::connect(addr_proxy).await;
     if server_connect.is_err() {
-        println!("erro ao iniciar conexão para o proxy ");
+        println!("Erro ao conectar ao destino {}");
         return Ok(());
     }
 
@@ -77,6 +76,7 @@ async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
     let server_to_client = transfer_data(server_read, client_write);
 
     tokio::try_join!(client_to_server, server_to_client)?;
+
     Ok(())
 }
 
@@ -113,10 +113,8 @@ fn get_port() -> u16 {
     let args: Vec<String> = env::args().collect();
     let mut port = 80;
     for i in 1..args.len() {
-        if args[i] == "--port" {
-            if i + 1 < args.len() {
-                port = args[i + 1].parse().unwrap_or(80);
-            }
+        if args[i] == "--port" && i + 1 < args.len() {
+            port = args[i + 1].parse().unwrap_or(80);
         }
     }
     port
@@ -126,11 +124,9 @@ fn get_status() -> String {
     let args: Vec<String> = env::args().collect();
     let mut status = String::from("@RustyManager");
     for i in 1..args.len() {
-        if args[i] == "--status" {
-            if i + 1 < args.len() {
-                status = args[i + 1].clone();
-            }
+        if args[i] == "--status" && i + 1 < args.len() {
+            status = args[i + 1].clone();
         }
     }
     status
-    }
+}
