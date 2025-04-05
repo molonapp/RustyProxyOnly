@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep, Duration, timeout};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -35,20 +35,16 @@ async fn start_http(listener: TcpListener) {
 async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
     let status = get_status();
 
-    // Camuflagem HTTP para fingir ser resposta web
-    let fake_http_response = format!(
-        "HTTP/1.1 200 {}\r\nContent-Type: text/html\r\nConnection: keep-alive\r\n\r\n",
+    // Resposta falsa com headers e padding
+    let fake_response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 120\r\nConnection: keep-alive\r\n\r\n<html><body><h1>{}</h1><p>Bem-vindo</p><p>...</p></body></html>\r\n\r\n",
         status
     );
-    client_stream.write_all(fake_http_response.as_bytes()).await?;
 
-    // Espera por uma "requisição" malformada, sem se importar com o conteúdo
-    let mut buffer = vec![0; 2048];
-    let _ = timeout(Duration::from_secs(2), client_stream.read(&mut buffer)).await;
+    client_stream.write_all(fake_response.as_bytes()).await?;
+    sleep(Duration::from_secs(5)).await; // Delay para DPI não detectar
 
-    // Decide qual proxy usar (22 ou 1194)
-    let mut addr_proxy = "0.0.0.0:22"; // padrão
-
+    let mut addr_proxy = "0.0.0.0:22";
     let result = timeout(Duration::from_secs(1), peek_stream(&mut client_stream)).await
         .unwrap_or_else(|_| Ok(String::new()));
 
@@ -58,16 +54,17 @@ async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
         } else {
             addr_proxy = "0.0.0.0:1194";
         }
+    } else {
+        addr_proxy = "0.0.0.0:22";
     }
 
     let server_connect = TcpStream::connect(addr_proxy).await;
     if server_connect.is_err() {
-        println!("Erro ao conectar ao destino proxy");
+        println!("erro ao iniciar conexão para o proxy ");
         return Ok(());
     }
 
     let server_stream = server_connect?;
-
     let (client_read, client_write) = client_stream.into_split();
     let (server_read, server_write) = server_stream.into_split();
 
@@ -80,7 +77,6 @@ async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
     let server_to_client = transfer_data(server_read, client_write);
 
     tokio::try_join!(client_to_server, server_to_client)?;
-
     Ok(())
 }
 
@@ -102,7 +98,6 @@ async fn transfer_data(
         let mut write_guard = write_stream.lock().await;
         write_guard.write_all(&buffer[..bytes_read]).await?;
     }
-
     Ok(())
 }
 
@@ -117,7 +112,6 @@ async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
 fn get_port() -> u16 {
     let args: Vec<String> = env::args().collect();
     let mut port = 80;
-
     for i in 1..args.len() {
         if args[i] == "--port" {
             if i + 1 < args.len() {
@@ -125,14 +119,12 @@ fn get_port() -> u16 {
             }
         }
     }
-
     port
 }
 
 fn get_status() -> String {
     let args: Vec<String> = env::args().collect();
     let mut status = String::from("@RustyManager");
-
     for i in 1..args.len() {
         if args[i] == "--status" {
             if i + 1 < args.len() {
@@ -140,6 +132,5 @@ fn get_status() -> String {
             }
         }
     }
-
     status
-}
+    }
