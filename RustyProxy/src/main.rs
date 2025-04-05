@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -20,7 +21,7 @@ async fn start_proxy(listener: TcpListener) {
             Ok((client_stream, addr)) => {
                 tokio::spawn(async move {
                     if let Err(e) = handle_client(client_stream).await {
-                        println!("Erro com {}: {}", addr, e);
+                        println!("Erro ao processar cliente {}: {}", addr, e);
                     }
                 });
             }
@@ -31,11 +32,26 @@ async fn start_proxy(listener: TcpListener) {
     }
 }
 
-async fn handle_client(client_stream: TcpStream) -> Result<(), Error> {
-    // Aqui você pode definir o destino fixo ou decidir por porta de entrada, args, etc
-    let addr_proxy = get_target(); // Ex: "127.0.0.1:22" para SSH
+async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
+    let mut addr_proxy = "127.0.0.1:22";
+    let result = timeout(Duration::from_millis(500), peek_stream(&mut client_stream)).await
+        .unwrap_or_else(|_| Ok(String::new()));
 
-    let server_stream = TcpStream::connect(addr_proxy).await?;
+    if let Ok(data) = result {
+        if data.contains("SSH") || data.is_empty() {
+            addr_proxy = "127.0.0.1:22";
+        } else {
+            addr_proxy = "127.0.0.1:1194";
+        }
+    }
+
+    let server_connect = TcpStream::connect(addr_proxy).await;
+    if server_connect.is_err() {
+        println!("Erro ao conectar no proxy: {}", addr_proxy);
+        return Ok(());
+    }
+
+    let server_stream = server_connect?;
     let (client_read, client_write) = client_stream.into_split();
     let (server_read, server_write) = server_stream.into_split();
 
@@ -44,10 +60,11 @@ async fn handle_client(client_stream: TcpStream) -> Result<(), Error> {
     let server_read = Arc::new(Mutex::new(server_read));
     let server_write = Arc::new(Mutex::new(server_write));
 
-    let c_to_s = transfer_data(client_read, server_write.clone());
-    let s_to_c = transfer_data(server_read, client_write.clone());
+    let client_to_server = transfer_data(client_read, server_write);
+    let server_to_client = transfer_data(server_read, client_write);
 
-    tokio::try_join!(c_to_s, s_to_c)?;
+    tokio::try_join!(client_to_server, server_to_client)?;
+
     Ok(())
 }
 
@@ -73,18 +90,40 @@ async fn transfer_data(
     Ok(())
 }
 
+async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
+    let mut peek_buffer = vec![0; 512];
+    let bytes_peeked = stream.peek(&mut peek_buffer).await?;
+    let data = &peek_buffer[..bytes_peeked];
+    let data_str = String::from_utf8_lossy(data);
+    Ok(data_str.to_string())
+}
+
 fn get_port() -> u16 {
     let args: Vec<String> = env::args().collect();
     let mut port = 80;
+
     for i in 1..args.len() {
-        if args[i] == "--port" && i + 1 < args.len() {
-            port = args[i + 1].parse().unwrap_or(80);
+        if args[i] == "--port" {
+            if i + 1 < args.len() {
+                port = args[i + 1].parse().unwrap_or(80);
+            }
         }
     }
+
     port
 }
 
-fn get_target() -> &'static str {
-    // Altere para o endereço de destino que deseja rotear
-    "127.0.0.1:22"
+fn get_status() -> String {
+    let args: Vec<String> = env::args().collect();
+    let mut status = String::from("@RustyManager");
+
+    for i in 1..args.len() {
+        if args[i] == "--status" {
+            if i + 1 < args.len() {
+                status = args[i + 1].clone();
+            }
+        }
+    }
+
+    status
 }
