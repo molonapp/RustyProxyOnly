@@ -1,125 +1,79 @@
 use std::env;
 use std::io::Error;
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
-
-/// Configuração via linha de comando
-struct Config {
-    listen_port: u16,
-    ssh_port: u16,
-    openvpn_port: u16,
-    status: String,
-}
-
-impl Config {
-    fn from_args() -> Self {
-        let args: Vec<String> = env::args().collect();
-        let mut cfg = Config {
-            listen_port: 80,
-            ssh_port: 22,
-            openvpn_port: 1194,
-            status: "@RustyManager".into(),
-        };
-        for i in 1..args.len() {
-            match args[i].as_str() {
-                "--port" if i + 1 < args.len() => {
-                    cfg.listen_port = args[i + 1].parse().unwrap_or(80);
-                }
-                "--ssh-port" if i + 1 < args.len() => {
-                    cfg.ssh_port = args[i + 1].parse().unwrap_or(22);
-                }
-                "--openvpn-port" if i + 1 < args.len() => {
-                    cfg.openvpn_port = args[i + 1].parse().unwrap_or(1194);
-                }
-                "--status" if i + 1 < args.len() => {
-                    cfg.status = args[i + 1].clone();
-                }
-                _ => {}
-            }
-        }
-        cfg
-    }
-}
-
-/// Protocolos suportados
-enum Protocolo { SSH, OpenVPN, Desconhecido }
+use sha1::{Sha1, Digest};
+use base64::{engine::general_purpose, Engine as _};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let cfg = Config::from_args();
-    let listener = TcpListener::bind(format!("[::]:{}", cfg.listen_port)).await?;
-    println!("RustyProxy ouvindo na porta {}", cfg.listen_port);
+    let port = env::args().skip_while(|a| a != "--port").nth(1)
+        .and_then(|p| p.parse().ok()).unwrap_or(80);
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    println!("RustyProxy ouvindo na porta {}", port);
+
     loop {
-        let (stream, addr) = listener.accept().await?;
-        println!("Nova conexão de {}", addr);
-        let cfg = cfg.clone();
+        let (mut client, addr) = listener.accept().await?;
+        println!("Conexão de {}", addr);
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, cfg).await {
-                eprintln!("Erro ao processar {}: {}", addr, e);
+            if let Err(e) = handle_client(&mut client).await {
+                eprintln!("Erro com {}: {}", addr, e);
             }
         });
     }
 }
 
-async fn handle_client(mut client: TcpStream, cfg: Config) -> Result<(), Error> {
-    // 1) Handshake HTTP simulado
-    client
-        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", cfg.status).as_bytes())
-        .await?;
-    client
-        .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", cfg.status).as_bytes())
-        .await?;
+async fn handle_client(client: &mut TcpStream) -> Result<(), Error> {
+    // 1) Leia o pedido do cliente (handshake WebSocket)
+    let mut buf = [0u8; 2048];
+    let n = client.read(&mut buf).await?;
+    if n == 0 { return Ok(()); }
+    let req = String::from_utf8_lossy(&buf[..n]);
 
-    // 2) Detecta protocolo em até 1s
-    let proto = match timeout(Duration::from_secs(1), peek(&mut client)).await {
-        Ok(Ok(txt)) if txt.starts_with("SSH-") || txt.is_empty() => Protocolo::SSH,
-        Ok(Ok(_)) => Protocolo::OpenVPN,
-        _ => Protocolo::Desconhecido,
+    // 2) Extraia a chave
+    let key = req.lines()
+        .find_map(|line| {
+            let l = line.to_lowercase();
+            if l.starts_with("sec-websocket-key:") {
+                Some(line.split(':').nth(1).unwrap().trim().to_string())
+            } else { None }
+        })
+        .unwrap_or_default();
+
+    // 3) Calcule o Sec-WebSocket-Accept
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let accept = general_purpose::STANDARD.encode(hasher.finalize());
+
+    // 4) Envie o handshake real
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\r\n",
+        accept
+    );
+    client.write_all(response.as_bytes()).await?;
+
+    // 5) Detecte protocolo (SSH vs OpenVPN) opcionalmente
+    let target = {
+        let mut peek_buf = [0u8; 512];
+        let protocol = timeout(Duration::from_secs(1), client.peek(&mut peek_buf))
+            .await.ok()
+            .and_then(|r| r.ok())
+            .filter(|&n| n>0)
+            .map(|n| String::from_utf8_lossy(&peek_buf[..n]).to_lowercase())
+            .unwrap_or_default();
+        if protocol.contains("ssh") { "127.0.0.1:22" } else { "127.0.0.1:1194" }
     };
 
-    let target = match proto {
-        Protocolo::SSH | Protocolo::Desconhecido => format!("127.0.0.1:{}", cfg.ssh_port),
-        Protocolo::OpenVPN => format!("127.0.0.1:{}", cfg.openvpn_port),
-    };
     println!("Encaminhando tráfego para {}", target);
 
-    // 3) Conecta ao destino e faz túnel bidirecional IMEDIATAMENTE
-    let mut server = TcpStream::connect(&target).await?;
-    copy_bidirectional(&mut client, &mut server).await?;
+    // 6) Conecte e faça túnel bidirecional imediatamente
+    let mut server = TcpStream::connect(target).await?;
+    copy_bidirectional(client, &mut server).await?;
 
     Ok(())
-}
-
-async fn peek(stream: &mut TcpStream) -> Result<String, Error> {
-    let mut buf = [0u8; 512];
-    let n = stream.peek(&mut buf).await?;
-    Ok(String::from_utf8_lossy(&buf[..n]).to_string())
-}
-
-fn get_port() -> u16 {
-    env::args()
-        .skip_while(|a| a != "--port")
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(80)
-}
-
-fn get_status() -> String {
-    env::args()
-        .skip_while(|a| a != "--status")
-        .nth(1)
-        .unwrap_or_else(|| "@RustyManager".into())
-}
-
-// Permitir clonar Config
-impl Clone for Config {
-    fn clone(&self) -> Self {
-        Config {
-            listen_port: self.listen_port,
-            ssh_port: self.ssh_port,
-            openvpn_port: self.openvpn_port,
-            status: self.status.clone(),
-        }
-    }
 }
