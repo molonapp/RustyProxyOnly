@@ -5,8 +5,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
-
-const XOR_KEY: u8 = 0x5A;
+use sha1::{Sha1, Digest};
+use base64::{engine::general_purpose, Engine as _};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -27,41 +27,52 @@ async fn start_http(listener: TcpListener) {
                     }
                 });
             }
-            Err(e) => println!("Erro ao aceitar conexão: {}", e),
+            Err(e) => {
+                println!("Erro ao aceitar conexão: {}", e);
+            }
         }
     }
 }
 
 async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
-    let status = get_status();
+    // Lê headers HTTP iniciais do cliente (handshake WebSocket fake)
+    let mut buffer = vec![0; 2048];
+    let n = client_stream.read(&mut buffer).await?;
+    if n == 0 {
+        return Ok(());
+    }
 
-    // Envia resposta HTTP fake
-    client_stream
-        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
-        .await?;
+    let request = String::from_utf8_lossy(&buffer[..n]);
+    let key = extract_websocket_key(&request).unwrap_or_else(|| "default_key".to_string());
+    let accept_key = generate_websocket_accept(&key);
 
-    let mut buffer = vec![0; 1024];
-    let _ = client_stream.read(&mut buffer).await?;
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\
+         \r\n",
+        accept_key
+    );
 
-    // Decide o destino com base no conteúdo (simples detecção ou arbitrário)
-    let addr_proxy = {
-        let result = timeout(Duration::from_secs(1), peek_stream(&mut client_stream)).await
-            .unwrap_or_else(|_| Ok(String::new()));
+    client_stream.write_all(response.as_bytes()).await?;
 
-        if let Ok(data) = result {
-            if data.contains("SSH") || data.is_empty() {
-                "0.0.0.0:22"
-            } else {
-                "0.0.0.0:1194"
-            }
+    // Decide se redireciona para SSH ou OpenVPN
+    let mut addr_proxy = "0.0.0.0:22";
+    let result = timeout(Duration::from_secs(1), peek_stream(&mut client_stream)).await
+        .unwrap_or_else(|_| Ok(String::new()));
+
+    if let Ok(data) = result {
+        if data.contains("SSH") || data.is_empty() {
+            addr_proxy = "0.0.0.0:22";
         } else {
-            "0.0.0.0:22"
+            addr_proxy = "0.0.0.0:1194";
         }
-    };
+    }
 
     let server_connect = TcpStream::connect(addr_proxy).await;
     if server_connect.is_err() {
-        println!("erro ao iniciar conexão para o proxy");
+        println!("Erro ao conectar com o destino");
         return Ok(());
     }
 
@@ -75,15 +86,15 @@ async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
     let server_read = Arc::new(Mutex::new(server_read));
     let server_write = Arc::new(Mutex::new(server_write));
 
-    let client_to_server = transfer_data_xor(client_read, server_write);
-    let server_to_client = transfer_data_xor(server_read, client_write);
+    let client_to_server = transfer_data(client_read, server_write);
+    let server_to_client = transfer_data(server_read, client_write);
 
     tokio::try_join!(client_to_server, server_to_client)?;
 
     Ok(())
 }
 
-async fn transfer_data_xor(
+async fn transfer_data(
     read_stream: Arc<Mutex<tokio::net::tcp::OwnedReadHalf>>,
     write_stream: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
 ) -> Result<(), Error> {
@@ -98,10 +109,8 @@ async fn transfer_data_xor(
             break;
         }
 
-        let xor_data: Vec<u8> = buffer[..bytes_read].iter().map(|b| b ^ XOR_KEY).collect();
-
         let mut write_guard = write_stream.lock().await;
-        write_guard.write_all(&xor_data).await?;
+        write_guard.write_all(&buffer[..bytes_read]).await?;
     }
 
     Ok(())
@@ -111,7 +120,24 @@ async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
     let mut peek_buffer = vec![0; 8192];
     let bytes_peeked = stream.peek(&mut peek_buffer).await?;
     let data = &peek_buffer[..bytes_peeked];
-    Ok(String::from_utf8_lossy(data).to_string())
+    let data_str = String::from_utf8_lossy(data);
+    Ok(data_str.to_string())
+}
+
+fn extract_websocket_key(request: &str) -> Option<String> {
+    for line in request.lines() {
+        if line.to_lowercase().starts_with("sec-websocket-key:") {
+            return Some(line[18..].trim().to_string());
+        }
+    }
+    None
+}
+
+fn generate_websocket_accept(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key));
+    let result = hasher.finalize();
+    general_purpose::STANDARD.encode(&result)
 }
 
 fn get_port() -> u16 {
