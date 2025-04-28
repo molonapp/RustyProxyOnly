@@ -1,75 +1,148 @@
 use std::env;
 use std::io::Error;
-use tokio::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::accept_hdr_async;
-use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-use futures_util::{StreamExt, SinkExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio::{time::{Duration}};
+use tokio::time::timeout;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    // Iniciando o proxy
     let port = get_port();
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    println!("Servidor WebSocket iniciado na porta {}", port);
+    let listener = TcpListener::bind(format!("[::]:{}", port)).await?;
+    println!("Iniciando serviço na porta: {}", port);
+    start_http(listener).await;
+    Ok(())
+}
 
+async fn start_http(listener: TcpListener) {
     loop {
-        let (stream, addr) = listener.accept().await?;
-        println!("Nova conexão de: {}", addr);
-
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream).await {
-                println!("Erro na conexão com {}: {}", addr, e);
+        match listener.accept().await {
+            Ok((client_stream, addr)) => {
+                tokio::spawn(async move {
+                    if let Err(e) = handle_client(client_stream).await {
+                        println!("Erro ao processar cliente {}: {}", addr, e);
+                    }
+                });
             }
-        });
+            Err(e) => {
+                println!("Erro ao aceitar conexão: {}", e);
+            }
+        }
     }
 }
 
-async fn handle_connection(stream: TcpStream) -> Result<(), Error> {
-    let ws_stream = accept_hdr_async(stream, |req: &Request, mut res: Response| {
-        println!("Handshake recebido de {}", req.uri());
-        Ok(res)
-    }).await?;
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
+    let status = get_status();
+    client_stream
+        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
+        .await?;
 
-    let mut target_stream = TcpStream::connect("127.0.0.1:22").await?;
-    let (mut target_reader, mut target_writer) = target_stream.split();
+    let mut buffer = vec![0; 1024];
+    client_stream.read(&mut buffer).await?;
+    client_stream
+        .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes())
+        .await?;
 
-    // WS -> SSH
-    let ws_to_ssh = async {
-        while let Some(msg) = ws_receiver.next().await {
-            let msg = msg?;
-            if let Message::Binary(data) = msg {
-                target_writer.write_all(&data).await?;
-            }
+    let mut addr_proxy = "0.0.0.0:22";
+    let result = timeout(Duration::from_secs(1), peek_stream(&mut client_stream)).await
+        .unwrap_or_else(|_| Ok(String::new()));
+
+    if let Ok(data) = result {
+        if data.contains("SSH") || data.is_empty() {
+            addr_proxy = "0.0.0.0:22";
+        } else {
+            addr_proxy = "0.0.0.0:1194";
         }
-        Ok::<_, Error>(())
-    };
+    } else {
+        addr_proxy = "0.0.0.0:22";
+    }
 
-    // SSH -> WS
-    let ssh_to_ws = async {
-        let mut buf = [0u8; 1024];
-        loop {
-            let n = target_reader.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            ws_sender.send(Message::Binary(buf[..n].to_vec())).await?;
-        }
-        Ok::<_, Error>(())
-    };
+    let server_connect = TcpStream::connect(addr_proxy).await;
+    if server_connect.is_err() {
+        println!("erro ao iniciar conexão para o proxy ");
+        return Ok(());
+    }
 
-    tokio::try_join!(ws_to_ssh, ssh_to_ws)?;
+
+
+    let server_stream = server_connect?;
+
+    let (client_read, client_write) = client_stream.into_split();
+    let (server_read, server_write) = server_stream.into_split();
+
+    let client_read = Arc::new(Mutex::new(client_read));
+    let client_write = Arc::new(Mutex::new(client_write));
+    let server_read = Arc::new(Mutex::new(server_read));
+    let server_write = Arc::new(Mutex::new(server_write));
+
+    let client_to_server = transfer_data(client_read, server_write);
+    let server_to_client = transfer_data(server_read, client_write);
+
+    tokio::try_join!(client_to_server, server_to_client)?;
 
     Ok(())
 }
 
+async fn transfer_data(
+    read_stream: Arc<Mutex<tokio::net::tcp::OwnedReadHalf>>,
+    write_stream: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+) -> Result<(), Error> {
+    let mut buffer = [0; 8192];
+    loop {
+        let bytes_read = {
+            let mut read_guard = read_stream.lock().await;
+            read_guard.read(&mut buffer).await?
+        };
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        let mut write_guard = write_stream.lock().await;
+        write_guard.write_all(&buffer[..bytes_read]).await?;
+    }
+
+    Ok(())
+}
+
+async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
+    let mut peek_buffer = vec![0; 8192];
+    let bytes_peeked = stream.peek(&mut peek_buffer).await?;
+    let data = &peek_buffer[..bytes_peeked];
+    let data_str = String::from_utf8_lossy(data);
+    Ok(data_str.to_string())
+}
+
+
 fn get_port() -> u16 {
     let args: Vec<String> = env::args().collect();
-    for i in 0..args.len() {
-        if args[i] == "--port" && i + 1 < args.len() {
-            return args[i + 1].parse().unwrap_or(80);
+    let mut port = 80;
+
+    for i in 1..args.len() {
+        if args[i] == "--port" {
+            if i + 1 < args.len() {
+                port = args[i + 1].parse().unwrap_or(80);
+            }
         }
     }
-    80
+
+    port
+}
+
+fn get_status() -> String {
+    let args: Vec<String> = env::args().collect();
+    let mut status = String::from("@RustyManager");
+
+    for i in 1..args.len() {
+        if args[i] == "--status" {
+            if i + 1 < args.len() {
+                status = args[i + 1].clone();
+            }
+        }
+    }
+
+    status
 }
